@@ -1,410 +1,187 @@
-use std::path::PathBuf;
-use std::time::Duration;
+use agent_bus::{Bus, BusError, BusMessage};
+use serde_json::json;
 
-use agent_bus::{Broker, BusClient, Frame, Target};
-use tokio::net::UnixListener;
-use tokio::task::JoinHandle;
+#[test]
+fn register_and_send() {
+    let bus = Bus::new();
+    let alice = bus.register("alice").unwrap();
+    let mut bob = bus.register("bob").unwrap();
 
-/// Spawn a broker on a unique temp socket. Returns the socket path and task handle.
-async fn start_broker() -> (PathBuf, JoinHandle<()>) {
-    let socket = std::env::temp_dir().join(format!("agent-bus-test-{}.sock", uuid::Uuid::new_v4()));
-    let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket).unwrap();
-    let path = socket.clone();
-    let handle = tokio::spawn(async move {
-        let _ = Broker::new().run(listener).await;
-    });
-    // Give the broker a moment to start accepting connections
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    (path, handle)
-}
+    alice.send("bob", "ping", json!({"n": 1})).unwrap();
 
-#[tokio::test]
-async fn test_register_and_send() {
-    let (socket, _handle) = start_broker().await;
-
-    let alice = BusClient::connect(&socket, "alice").await.unwrap();
-    let mut bob = BusClient::connect(&socket, "bob").await.unwrap();
-
-    // alice sends to bob
-    alice
-        .send(Target::Named("bob".into()), "greeting", serde_json::json!({"text": "hello"}))
-        .await
-        .unwrap();
-
-    // bob receives the message (skip any PeerConnected events first)
-    let msg = recv_message(&mut bob).await;
+    let msg = bob.try_recv().unwrap();
     assert_eq!(msg.from, "alice");
-    assert_eq!(msg.kind, "greeting");
-    assert_eq!(msg.payload["text"], "hello");
+    assert_eq!(msg.to, "bob");
+    assert_eq!(msg.kind, "ping");
+    assert_eq!(msg.payload, json!({"n": 1}));
+}
 
-    let _ = std::fs::remove_file(&socket);
+#[test]
+fn duplicate_name_rejected() {
+    let bus = Bus::new();
+    let _alice = bus.register("alice").unwrap();
+
+    let err = bus.register("alice").unwrap_err();
+    assert!(matches!(err, BusError::NameTaken(_)));
+}
+
+#[test]
+fn unknown_recipient() {
+    let bus = Bus::new();
+    let alice = bus.register("alice").unwrap();
+
+    let err = alice.send("nobody", "ping", json!(null)).unwrap_err();
+    assert!(matches!(err, BusError::UnknownRecipient(_)));
+}
+
+#[test]
+fn drop_deregisters() {
+    let bus = Bus::new();
+    let alice = bus.register("alice").unwrap();
+    drop(alice);
+
+    // Name is available again after drop
+    let _alice2 = bus.register("alice").unwrap();
 }
 
 #[tokio::test]
-async fn test_topic_pubsub() {
-    let (socket, _handle) = start_broker().await;
+async fn recv_none_when_deregistered() {
+    let bus = Bus::new();
+    let mut bob = bus.register("bob").unwrap();
 
-    let pub_client = BusClient::connect(&socket, "pub").await.unwrap();
-    let mut sub1 = BusClient::connect(&socket, "sub1").await.unwrap();
-    let mut sub2 = BusClient::connect(&socket, "sub2").await.unwrap();
+    // Deregistering bob (removing sender from registry) closes the channel
+    bus.deregister("bob");
 
-    sub1.subscribe("events").await.unwrap();
-    sub2.subscribe("events").await.unwrap();
-
-    // Small delay so subscribe frames are processed before publish
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    pub_client
-        .send(Target::Topic("events".into()), "event", serde_json::json!({"n": 1}))
-        .await
-        .unwrap();
-
-    let m1 = recv_message(&mut sub1).await;
-    let m2 = recv_message(&mut sub2).await;
-
-    assert_eq!(m1.from, "pub");
-    assert_eq!(m1.kind, "event");
-    assert_eq!(m2.from, "pub");
-    assert_eq!(m2.kind, "event");
-
-    let _ = std::fs::remove_file(&socket);
+    assert!(bob.recv().await.is_none());
 }
 
-#[tokio::test]
-async fn test_broadcast() {
-    let (socket, _handle) = start_broker().await;
+#[test]
+fn bidirectional_messaging() {
+    let bus = Bus::new();
+    let mut alice = bus.register("alice").unwrap();
+    let mut bob = bus.register("bob").unwrap();
 
-    let mut sender = BusClient::connect(&socket, "sender").await.unwrap();
-    let mut recv1 = BusClient::connect(&socket, "recv1").await.unwrap();
-    let mut recv2 = BusClient::connect(&socket, "recv2").await.unwrap();
+    alice.send("bob", "ping", json!(null)).unwrap();
+    bob.send("alice", "pong", json!(null)).unwrap();
 
-    sender
-        .send(Target::Broadcast, "shout", serde_json::json!({"msg": "hi all"}))
-        .await
-        .unwrap();
+    let from_bob = alice.try_recv().unwrap();
+    assert_eq!(from_bob.kind, "pong");
+    assert_eq!(from_bob.from, "bob");
 
-    let m1 = recv_message(&mut recv1).await;
-    let m2 = recv_message(&mut recv2).await;
-
-    assert_eq!(m1.from, "sender");
-    assert_eq!(m1.kind, "shout");
-    assert_eq!(m2.from, "sender");
-    assert_eq!(m2.kind, "shout");
-
-    // sender should NOT receive its own broadcast — verify no message arrives within timeout
-    let timeout_result =
-        tokio::time::timeout(Duration::from_millis(100), recv_message(&mut sender)).await;
-    assert!(timeout_result.is_err(), "sender must not receive its own broadcast");
-
-    let _ = std::fs::remove_file(&socket);
+    let from_alice = bob.try_recv().unwrap();
+    assert_eq!(from_alice.kind, "ping");
+    assert_eq!(from_alice.from, "alice");
 }
 
-#[tokio::test]
-async fn test_duplicate_name_rejected() {
-    let (socket, _handle) = start_broker().await;
+#[test]
+fn multiple_messages_ordered() {
+    let bus = Bus::new();
+    let alice = bus.register("alice").unwrap();
+    let mut bob = bus.register("bob").unwrap();
 
-    let _alice = BusClient::connect(&socket, "alice").await.unwrap();
-
-    // Second client trying to register as "alice" should get an error
-    let result = BusClient::connect(&socket, "alice").await;
-    assert!(result.is_err(), "duplicate name must be rejected");
-
-    let _ = std::fs::remove_file(&socket);
-}
-
-#[tokio::test]
-async fn test_peer_lifecycle() {
-    let (socket, _handle) = start_broker().await;
-
-    let mut watcher = BusClient::connect(&socket, "watcher").await.unwrap();
-
-    // joiner connects — watcher should receive PeerConnected
-    let joiner = BusClient::connect(&socket, "joiner").await.unwrap();
-
-    let connected = recv_peer_connected(&mut watcher).await;
-    assert_eq!(connected, "joiner");
-
-    // joiner disconnects by dropping
-    drop(joiner);
-
-    let disconnected = recv_peer_disconnected(&mut watcher).await;
-    assert_eq!(disconnected, "joiner");
-
-    let _ = std::fs::remove_file(&socket);
-}
-
-#[tokio::test]
-async fn test_named_unknown_target() {
-    let (socket, _handle) = start_broker().await;
-
-    let mut alice = BusClient::connect(&socket, "alice").await.unwrap();
-
-    alice
-        .send(Target::Named("nobody".into()), "ping", serde_json::json!(null))
-        .await
-        .unwrap();
-
-    // alice should receive an Error frame back
-    let frame = tokio::time::timeout(Duration::from_millis(500), alice.recv())
-        .await
-        .expect("timed out waiting for error frame")
-        .expect("channel closed");
-
-    match frame {
-        Frame::Error { message } => {
-            assert!(message.contains("nobody"), "error should mention the unknown target");
-        }
-        other => panic!("expected Error frame, got {:?}", other),
+    for i in 0..5 {
+        alice.send("bob", "seq", json!({"n": i})).unwrap();
     }
 
-    let _ = std::fs::remove_file(&socket);
+    for i in 0..5 {
+        let msg = bob.try_recv().unwrap();
+        assert_eq!(msg.payload["n"], i);
+    }
+
+    assert!(bob.try_recv().is_none());
 }
 
-#[tokio::test]
-async fn test_unsubscribe() {
-    let (socket, _handle) = start_broker().await;
+#[test]
+fn complex_payload() {
+    let bus = Bus::new();
+    let alice = bus.register("alice").unwrap();
+    let mut bob = bus.register("bob").unwrap();
 
-    let publisher = BusClient::connect(&socket, "pub").await.unwrap();
-    let mut sub = BusClient::connect(&socket, "sub").await.unwrap();
-
-    sub.subscribe("events").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    // First message should arrive
-    publisher
-        .send(Target::Topic("events".into()), "ev", serde_json::json!(1))
-        .await
-        .unwrap();
-    let m = recv_message(&mut sub).await;
-    assert_eq!(m.payload, serde_json::json!(1));
-
-    // Unsubscribe and send again — should NOT arrive
-    sub.unsubscribe("events").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    publisher
-        .send(Target::Topic("events".into()), "ev", serde_json::json!(2))
-        .await
-        .unwrap();
-
-    let timeout = tokio::time::timeout(Duration::from_millis(200), recv_message(&mut sub)).await;
-    assert!(timeout.is_err(), "unsubscribed client must not receive topic messages");
-
-    let _ = std::fs::remove_file(&socket);
-}
-
-#[tokio::test]
-async fn test_topic_excludes_sender() {
-    let (socket, _handle) = start_broker().await;
-
-    let mut pubsub = BusClient::connect(&socket, "pubsub").await.unwrap();
-    let mut other = BusClient::connect(&socket, "other").await.unwrap();
-
-    // Both subscribe to same topic
-    pubsub.subscribe("chat").await.unwrap();
-    other.subscribe("chat").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    // pubsub publishes to the topic it's subscribed to
-    pubsub
-        .send(Target::Topic("chat".into()), "msg", serde_json::json!("hello"))
-        .await
-        .unwrap();
-
-    // other receives it
-    let m = recv_message(&mut other).await;
-    assert_eq!(m.from, "pubsub");
-
-    // pubsub must NOT receive its own message
-    let timeout =
-        tokio::time::timeout(Duration::from_millis(200), recv_message(&mut pubsub)).await;
-    assert!(timeout.is_err(), "sender must not receive its own topic message");
-
-    let _ = std::fs::remove_file(&socket);
-}
-
-#[tokio::test]
-async fn test_multiple_topics() {
-    let (socket, _handle) = start_broker().await;
-
-    let publisher = BusClient::connect(&socket, "pub").await.unwrap();
-    let mut sub = BusClient::connect(&socket, "sub").await.unwrap();
-
-    sub.subscribe("alpha").await.unwrap();
-    sub.subscribe("beta").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    publisher
-        .send(Target::Topic("alpha".into()), "a", serde_json::json!("from-alpha"))
-        .await
-        .unwrap();
-    publisher
-        .send(Target::Topic("beta".into()), "b", serde_json::json!("from-beta"))
-        .await
-        .unwrap();
-
-    let m1 = recv_message(&mut sub).await;
-    let m2 = recv_message(&mut sub).await;
-
-    let kinds: Vec<&str> = vec![m1.kind.as_str(), m2.kind.as_str()];
-    assert!(kinds.contains(&"a"), "should receive from alpha topic");
-    assert!(kinds.contains(&"b"), "should receive from beta topic");
-
-    let _ = std::fs::remove_file(&socket);
-}
-
-#[tokio::test]
-async fn test_disconnect_cleans_topic_subscriptions() {
-    let (socket, _handle) = start_broker().await;
-
-    let publisher = BusClient::connect(&socket, "pub").await.unwrap();
-    let mut sub1 = BusClient::connect(&socket, "sub1").await.unwrap();
-    let sub2 = BusClient::connect(&socket, "sub2").await.unwrap();
-
-    sub1.subscribe("events").await.unwrap();
-    sub2.subscribe("events").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    // Drop sub2 — broker should remove it from topic subscribers
-    drop(sub2);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Publishing should still work for sub1 without errors
-    publisher
-        .send(Target::Topic("events".into()), "ev", serde_json::json!("still works"))
-        .await
-        .unwrap();
-
-    let m = recv_message(&mut sub1).await;
-    assert_eq!(m.payload, serde_json::json!("still works"));
-
-    let _ = std::fs::remove_file(&socket);
-}
-
-#[tokio::test]
-async fn test_client_name() {
-    let (socket, _handle) = start_broker().await;
-    let client = BusClient::connect(&socket, "my-agent").await.unwrap();
-    assert_eq!(client.name(), "my-agent");
-    let _ = std::fs::remove_file(&socket);
-}
-
-#[tokio::test]
-async fn test_bidirectional_named_messages() {
-    let (socket, _handle) = start_broker().await;
-
-    let mut alice = BusClient::connect(&socket, "alice").await.unwrap();
-    let mut bob = BusClient::connect(&socket, "bob").await.unwrap();
-
-    // alice -> bob
-    alice
-        .send(Target::Named("bob".into()), "ping", serde_json::json!("from alice"))
-        .await
-        .unwrap();
-    let m = recv_message(&mut bob).await;
-    assert_eq!(m.from, "alice");
-    assert_eq!(m.kind, "ping");
-
-    // bob -> alice
-    bob.send(Target::Named("alice".into()), "pong", serde_json::json!("from bob"))
-        .await
-        .unwrap();
-    let m = recv_message(&mut alice).await;
-    assert_eq!(m.from, "bob");
-    assert_eq!(m.kind, "pong");
-
-    let _ = std::fs::remove_file(&socket);
-}
-
-#[tokio::test]
-async fn test_complex_json_payload() {
-    let (socket, _handle) = start_broker().await;
-
-    let alice = BusClient::connect(&socket, "alice").await.unwrap();
-    let mut bob = BusClient::connect(&socket, "bob").await.unwrap();
-
-    let payload = serde_json::json!({
-        "nested": {"deep": {"value": 42}},
-        "array": [1, "two", null, true],
-        "empty": {},
-        "unicode": "caf\u{00e9} \u{1f600}"
+    let payload = json!({
+        "action": "deploy",
+        "targets": ["web-1", "web-2"],
+        "config": {
+            "replicas": 3,
+            "env": {"RUST_LOG": "debug"}
+        }
     });
 
-    alice
-        .send(Target::Named("bob".into()), "complex", payload.clone())
-        .await
-        .unwrap();
+    alice.send("bob", "deploy", payload.clone()).unwrap();
 
-    let m = recv_message(&mut bob).await;
-    assert_eq!(m.payload, payload);
+    let msg = bob.try_recv().unwrap();
+    assert_eq!(msg.payload, payload);
+}
 
-    let _ = std::fs::remove_file(&socket);
+#[test]
+fn message_has_uuid() {
+    let bus = Bus::new();
+    let alice = bus.register("alice").unwrap();
+    let mut bob = bus.register("bob").unwrap();
+
+    let id = alice.send("bob", "ping", json!(null)).unwrap();
+    let msg = bob.try_recv().unwrap();
+    assert_eq!(msg.id, id);
+}
+
+#[test]
+fn mailbox_name() {
+    let bus = Bus::new();
+    let alice = bus.register("alice").unwrap();
+    assert_eq!(alice.name(), "alice");
 }
 
 #[tokio::test]
-async fn test_topic_no_subscribers() {
-    let (socket, _handle) = start_broker().await;
+async fn async_recv() {
+    let bus = Bus::new();
+    let alice = bus.register("alice").unwrap();
+    let mut bob = bus.register("bob").unwrap();
 
-    let mut publisher = BusClient::connect(&socket, "pub").await.unwrap();
+    alice.send("bob", "hello", json!(null)).unwrap();
 
-    // Publish to a topic with no subscribers — should not error
-    publisher
-        .send(Target::Topic("ghost".into()), "ev", serde_json::json!(null))
-        .await
-        .unwrap();
-
-    // No error frame should come back
-    let timeout =
-        tokio::time::timeout(Duration::from_millis(200), recv_message(&mut publisher)).await;
-    assert!(timeout.is_err(), "publishing to empty topic should silently succeed");
-
-    let _ = std::fs::remove_file(&socket);
+    let msg = bob.recv().await.unwrap();
+    assert_eq!(msg.kind, "hello");
 }
 
-// --- helpers ---
+#[test]
+fn send_after_recipient_dropped() {
+    let bus = Bus::new();
+    let alice = bus.register("alice").unwrap();
+    let bob = bus.register("bob").unwrap();
+    drop(bob);
 
-/// Drain frames until we get a Message frame, skipping peer events.
-async fn recv_message(client: &mut BusClient) -> agent_bus::BusMessage {
-    loop {
-        let frame = tokio::time::timeout(Duration::from_millis(500), client.recv())
-            .await
-            .expect("timed out waiting for message")
-            .expect("channel closed");
-        match frame {
-            Frame::Message(msg) => return msg,
-            Frame::PeerConnected { .. } | Frame::PeerDisconnected { .. } => continue,
-            other => panic!("unexpected frame: {:?}", other),
-        }
-    }
+    let err = alice.send("bob", "ping", json!(null)).unwrap_err();
+    assert!(matches!(err, BusError::UnknownRecipient(_)));
 }
 
-/// Drain frames until we get a PeerConnected event, return the peer name.
-async fn recv_peer_connected(client: &mut BusClient) -> String {
-    loop {
-        let frame = tokio::time::timeout(Duration::from_millis(500), client.recv())
-            .await
-            .expect("timed out waiting for PeerConnected")
-            .expect("channel closed");
-        match frame {
-            Frame::PeerConnected { name } => return name,
-            Frame::Message(_) | Frame::PeerDisconnected { .. } => continue,
-            other => panic!("unexpected frame: {:?}", other),
-        }
-    }
+#[test]
+fn bus_clone_shares_state() {
+    let bus = Bus::new();
+    let bus2 = bus.clone();
+
+    let _alice = bus.register("alice").unwrap();
+    let err = bus2.register("alice").unwrap_err();
+    assert!(matches!(err, BusError::NameTaken(_)));
+
+    let _bob = bus2.register("bob").unwrap();
+    let alice2 = bus.register("alice2").unwrap();
+    alice2.send("bob", "hi", json!(null)).unwrap();
 }
 
-/// Drain frames until we get a PeerDisconnected event, return the peer name.
-async fn recv_peer_disconnected(client: &mut BusClient) -> String {
-    loop {
-        let frame = tokio::time::timeout(Duration::from_millis(500), client.recv())
-            .await
-            .expect("timed out waiting for PeerDisconnected")
-            .expect("channel closed");
-        match frame {
-            Frame::PeerDisconnected { name } => return name,
-            Frame::Message(_) | Frame::PeerConnected { .. } => continue,
-            other => panic!("unexpected frame: {:?}", other),
-        }
-    }
+#[test]
+fn serialization_roundtrip() {
+    let msg = BusMessage {
+        id: uuid::Uuid::new_v4(),
+        from: "alice".into(),
+        to: "bob".into(),
+        kind: "test".into(),
+        payload: json!({"key": "value"}),
+    };
+
+    let serialized = serde_json::to_string(&msg).unwrap();
+    let deserialized: BusMessage = serde_json::from_str(&serialized).unwrap();
+
+    assert_eq!(deserialized.from, msg.from);
+    assert_eq!(deserialized.to, msg.to);
+    assert_eq!(deserialized.kind, msg.kind);
+    assert_eq!(deserialized.payload, msg.payload);
 }

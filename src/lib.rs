@@ -1,8 +1,5 @@
-pub mod broker;
-pub mod client;
-pub mod message;
-pub mod wire;
+mod bus;
+mod message;
 
-pub use broker::Broker;
-pub use client::BusClient;
-pub use message::{BusMessage, Frame, Target};
+pub use bus::{Bus, BusError, Mailbox};
+pub use message::BusMessage;
