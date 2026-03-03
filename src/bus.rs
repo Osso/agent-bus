@@ -38,6 +38,12 @@ impl Bus {
         reg.remove(name);
     }
 
+    /// Returns the names of all currently registered agents.
+    pub fn list_registered(&self) -> Vec<String> {
+        let reg = self.registry.lock().unwrap();
+        reg.keys().cloned().collect()
+    }
+
     /// Register an agent by name, returning its Mailbox.
     pub fn register(&self, name: &str) -> Result<Mailbox, BusError> {
         let (tx, rx) = mpsc::unbounded_channel();
