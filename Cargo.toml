@@ -2,6 +2,9 @@
 name = "agent-bus"
 version = "0.2.0"
 edition = "2024"
+license = "MIT"
+description = "In-process message bus for agent coordination"
+repository = "https://github.com/Osso/agent-bus"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
