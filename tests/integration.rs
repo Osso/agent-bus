@@ -168,6 +168,33 @@ fn bus_clone_shares_state() {
 }
 
 #[test]
+fn list_registered_returns_current_names() {
+    let bus = Bus::new();
+    let alice = bus.register("alice").unwrap();
+    let _bob = bus.register("bob").unwrap();
+
+    let mut names = bus.list_registered();
+    names.sort();
+    assert_eq!(names, ["alice", "bob"]);
+
+    drop(alice);
+    assert_eq!(bus.list_registered(), ["bob"]);
+}
+
+#[test]
+fn default_bus_accepts_registrations() {
+    let bus = Bus::default();
+    let alice = bus.register("alice").unwrap();
+    let mut bob = bus.register("bob").unwrap();
+
+    alice.send("bob", "ping", json!(null)).unwrap();
+
+    let msg = bob.try_recv().unwrap();
+    assert_eq!(msg.from, "alice");
+    assert_eq!(msg.kind, "ping");
+}
+
+#[test]
 fn serialization_roundtrip() {
     let msg = BusMessage {
         id: uuid::Uuid::new_v4(),
